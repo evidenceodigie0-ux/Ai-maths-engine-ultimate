@@ -87,7 +87,30 @@ function polyParse(src){
   }
   const out=expr();if(i!==s.length)throw Error('Could not parse expression near: '+s.slice(i));return out;
 }
-function polyString(a){let terms=[];a.forEach((c,p)=>{if(Math.abs(c)<1e-9)return;let abs=Math.abs(c),v=p===0?fmt(abs):(abs===1?'':fmt(abs))+'x'+(p>1?'^'+p:'');terms.push({neg:c<0,v})});if(!terms.length)return '0';return terms.map((t,i)=>(i===0?(t.neg?'-':''):(t.neg?' - ':' + ')+t.v).join('')}
+
+function polyString(a) {
+  let terms = [];
+
+  a.forEach((c, p) => {
+    if (Math.abs(c) < 1e-9) return;
+
+    let abs = Math.abs(c);
+    let v = p === 0
+      ? fmt(abs)
+      : (abs === 1 ? '' : fmt(abs)) +
+        'x' + (p > 1 ? '^' + p : '');
+
+    terms.push({ neg: c < 0, v });
+  });
+
+  if (!terms.length) return '0';
+
+  return terms.map((t, i) =>
+    (i === 0
+      ? (t.neg ? '-' : '') + t.v
+      : (t.neg ? ' - ' : ' + ') + t.v)
+  ).join('');
+}
 function parseEquation(s){let bits=s.split('=');if(bits.length!==2)throw Error('Please write an equation with one equals sign, such as 2x+5=17.');return [polyParse(bits[0]),polyParse(bits[1])]}
 function subtractPoly(a,b){let n=Math.max(a.length,b.length),r=Array(n).fill(0);for(let i=0;i<n;i++)r[i]=(a[i]||0)-(b[i]||0);while(r.length>1&&Math.abs(r.at(-1))<1e-10)r.pop();return r}
 function solveLinear(a){let p=subtractPoly(a[0],a[1]);if(p.length>2)throw Error('This is not a linear equation.');let c=p[0]||0,m=p[1]||0;if(Math.abs(m)<1e-10)return Math.abs(c)<1e-10?'Every value of x satisfies the equation.':'No solution: the equation is inconsistent.';let x=-c/m;return `Rearrange into ax + b = 0:\n${polyString(p)} = 0\nMove the constant term and divide by the coefficient of x:\nx = ${fmt(x)}\n\nAnswer: x = ${fmt(x)}`}
