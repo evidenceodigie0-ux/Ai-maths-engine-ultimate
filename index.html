@@ -1,363 +1,131 @@
-from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
-import textwrap, json
-
-root = Path("/mnt/data/AI_Maths_Engine_Ultimate")
-(root / "app/static").mkdir(parents=True, exist_ok=True)
-(root / "tests").mkdir(parents=True, exist_ok=True)
-
-files = {
-"app/main.py": r'''
-import os, re
-from typing import Any
-import httpx
-import sympy as sp
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-STATIC = os.path.join(HERE, "static")
-app = FastAPI(title="AI Maths Engine Ultimate", version="1.0.0")
-
-FUNCTIONS = {
-    "sqrt": sp.sqrt, "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
-    "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
-    "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-    "log": sp.log, "ln": sp.log, "exp": sp.exp, "abs": sp.Abs,
-    "Abs": sp.Abs, "pi": sp.pi, "E": sp.E, "oo": sp.oo
-}
-GLOBALS = {"Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
-           "Symbol": sp.Symbol, "Add": sp.Add, "Mul": sp.Mul, "Pow": sp.Pow}
-TRANSFORMS = sp.parsing.sympy_parser.standard_transformations + (
-    sp.parsing.sympy_parser.convert_xor,
-    sp.parsing.sympy_parser.implicit_multiplication_application,
-)
-MAX_LEN = 400
-
-class SolveRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=500)
-    mode: str = "auto"
-
-class SolveResponse(BaseModel):
-    answer: str
-    method: str
-    verified: bool = False
-    notes: list[str] = []
-
-def parse_expr(s: str) -> sp.Expr:
-    s = s.strip().replace("−","-").replace("×","*").replace("÷","/").replace("π","pi")
-    if not s or len(s) > MAX_LEN:
-        raise ValueError("Enter a non-empty expression of 400 characters or fewer.")
-    if "__" in s or any(c in s for c in "[]{};`\\\\:"):
-        raise ValueError("Unsupported characters in expression.")
-    if not re.fullmatch(r"[A-Za-z0-9+*/^().,\-\s]+", s):
-        raise ValueError("Use standard maths notation, such as 2*x + 3, x^2, sqrt(x), or sin(x).")
-    allowed = set(FUNCTIONS) | {"x","y","z","t","a","b","c","n","r"}
-    names = re.findall(r"[A-Za-z][A-Za-z0-9]*", s)
-    for name in names:
-        if name not in allowed:
-            raise ValueError(f"Unsupported name '{name}'. Use x, y, z, t, a, b, c, n, r or common functions.")
-    local = dict(FUNCTIONS)
-    for name in ("x","y","z","t","a","b","c","n","r"):
-        local[name] = sp.Symbol(name, real=True)
-    try:
-        value = sp.parsing.sympy_parser.parse_expr(s, local_dict=local, global_dict=GLOBALS,
-                                                   transformations=TRANSFORMS, evaluate=True)
-    except Exception as e:
-        raise ValueError("I couldn't read that expression. Check brackets, operators and powers.") from e
-    if not isinstance(value, sp.Expr):
-        raise ValueError("Please enter a mathematical expression.")
-    return value
-
-def split_eq(s):
-    if s.count("=") != 1:
-        raise ValueError("Write one equation with one equals sign, e.g. 2*x + 5 = 17.")
-    return [part.strip() for part in s.split("=", 1)]
-
-def solve_local(raw: str) -> SolveResponse:
-    text = raw.strip().replace("−","-").replace("×","*").replace("÷","/")
-    low = text.lower()
-    if not text:
-        raise ValueError("Type a maths question first.")
-
-    if "simultaneous" in low or "system of equations" in low or (
-        len(re.split(r"[,;\\n]+", text)) >= 2 and "=" in text and re.search(r"\\by\\b", low)
-    ):
-        body = re.sub(r"^(solve\\s+)?(simultaneous equations|system of equations)\\s*:?", "", text, flags=re.I).strip()
-        raw_eqs = [p.strip() for p in re.split(r"[,;\\n]+", body) if p.strip()]
-        if len(raw_eqs) < 2:
-            raise ValueError("Enter two or more equations separated by commas, e.g. x+y=7, x-y=1.")
-        equations, symbols = [], set()
-        for item in raw_eqs:
-            l, r = split_eq(item)
-            lhs, rhs = parse_expr(l), parse_expr(r)
-            equations.append(sp.Eq(lhs, rhs))
-            symbols |= lhs.free_symbols | rhs.free_symbols
-        variables = sorted(symbols, key=lambda x: x.name)
-        sols = sp.solve(equations, variables, dict=True)
-        if not sols:
-            return SolveResponse(answer="No solution was found; the system may be inconsistent or need another method.", method="symbolic system solver")
-        lines = ["System:"] + [f"  {sp.sstr(e)}" for e in equations] + ["", "Solution:"]
-        for sol in sols:
-            lines += [f"  {v} = {sp.sstr(sol[v])}" for v in variables if v in sol]
-        verified = all(sp.simplify((e.lhs-e.rhs).subs(sol)) == 0 for sol in sols for e in equations)
-        lines += ["", "Verification: " + ("substitution gives zero residuals." if verified else "not conclusive.")]
-        return SolveResponse(answer="\\n".join(lines), method="SymPy symbolic system solver", verified=bool(verified))
-
-    commands = [
-        (r"^(differentiate|derivative of|find the derivative of)\\s*:?[ ]*", "diff"),
-        (r"^(integrate|integral of|find the integral of)\\s*:?[ ]*", "integrate"),
-        (r"^(factorise|factorize|factor)\\s*:?[ ]*", "factor"),
-        (r"^(expand)\\s*:?[ ]*", "expand"),
-        (r"^(simplify)\\s*:?[ ]*", "simplify"),
-    ]
-    for pattern, action in commands:
-        if re.match(pattern, text, re.I):
-            expr = parse_expr(re.sub(pattern, "", text, flags=re.I).strip())
-            vars_ = sorted(expr.free_symbols, key=lambda v:v.name)
-            x = next((v for v in vars_ if v.name == "x"), vars_[0] if vars_ else sp.Symbol("x"))
-            if action == "diff":
-                result = sp.diff(expr, x)
-                return SolveResponse(answer=f"Function: f({x}) = {sp.sstr(expr)}\\nApply differentiation rules.\\n\\nDerivative: {sp.sstr(result)}", method="symbolic differentiation", verified=sp.simplify(sp.diff(expr,x)-result)==0)
-            if action == "integrate":
-                expr = parse_expr(re.sub(r"\\s+dx$", "", re.sub(pattern, "", text, flags=re.I).strip()))
-                vars_ = sorted(expr.free_symbols, key=lambda v:v.name)
-                x = next((v for v in vars_ if v.name == "x"), vars_[0] if vars_ else sp.Symbol("x"))
-                result = sp.integrate(expr, x)
-                return SolveResponse(answer=f"Integrand: {sp.sstr(expr)}\\n\\nIntegral: {sp.sstr(result)} + C", method="symbolic integration", verified=sp.simplify(sp.diff(result,x)-expr)==0, notes=["Some integrals have no elementary antiderivative."])
-            result = {"factor":sp.factor, "expand":sp.expand, "simplify":sp.simplify}[action](expr)
-            return SolveResponse(answer=f"Original: {sp.sstr(expr)}\\n\\nResult: {sp.sstr(result)}", method=f"symbolic {action}", verified=sp.simplify(result-expr)==0)
-
-    if low.startswith("limit "):
-        body = re.sub(r"^limit\\s+", "", text, flags=re.I)
-        m = re.fullmatch(r"(.+?)\\s+as\\s+x\\s*(?:->|→)\\s*(.+)", body, flags=re.I)
-        if not m: raise ValueError("Use: limit sin(x)/x as x -> 0")
-        expr, point = parse_expr(m.group(1)), parse_expr(m.group(2))
-        val = sp.limit(expr, sp.Symbol("x", real=True), point)
-        return SolveResponse(answer=f"Limit: {sp.sstr(expr)} as x -> {sp.sstr(point)}\\n\\nAnswer: {sp.sstr(val)}", method="symbolic limit")
-
-    if low.startswith(("solve ", "solve for ", "find x ", "equation:")) or "=" in text:
-        body = re.sub(r"^(solve(?:\\s+for)?|find x|equation)\\s*:?[ ]*", "", text, flags=re.I)
-        left, right = split_eq(body)
-        lhs, rhs = parse_expr(left), parse_expr(right)
-        difference = sp.simplify(lhs-rhs)
-        variables = sorted(difference.free_symbols, key=lambda v:v.name)
-        if not variables:
-            ok = difference == 0
-            return SolveResponse(answer="Equation is true after simplification." if ok else "No variable values can make both sides equal.", method="equation check", verified=True)
-        x = next((v for v in variables if v.name == "x"), variables[0])
-        solutions = sp.solve(sp.Eq(lhs,rhs), x)
-        if not solutions:
-            return SolveResponse(answer=f"No solutions for {x} were found over the solver's default domain.", method="symbolic equation solver")
-        lines = [f"Equation: {sp.sstr(lhs)} = {sp.sstr(rhs)}", f"Rearranged: {sp.sstr(difference)} = 0", "", f"Solutions for {x}:"]
-        lines += [f"  {x} = {sp.sstr(sol)}" for sol in solutions]
-        verified = all(sp.simplify(difference.subs(x, sol)) == 0 for sol in solutions)
-        lines += ["", "Verification: " + ("substitution satisfies the equation." if verified else "not conclusive.")]
-        return SolveResponse(answer="\\n".join(lines), method="SymPy symbolic equation solver", verified=bool(verified))
-
-    expr = parse_expr(text)
-    return SolveResponse(answer=f"Recognised expression: {sp.sstr(expr)}\\nSimplified: {sp.sstr(sp.simplify(expr))}\\n\\nTry solve, differentiate, integrate, factor, expand, simplify, or limit.", method="symbolic expression parser", verified=True)
-
-async def ai_explanation(question: str, computed: str) -> str:
-    key = os.getenv("AI_API_KEY", "").strip()
-    model = os.getenv("AI_MODEL", "").strip()
-    url = os.getenv("AI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
-    if not key or not model:
-        raise HTTPException(status_code=503, detail="AI tutor not configured. Set AI_API_KEY and AI_MODEL on the server. The maths solver still works.")
-    payload = {"model":model,"temperature":0.1,"messages":[
-        {"role":"system","content":"You are a careful mathematics tutor. Explain the provided computed result without changing or inventing the answer. Mention uncertainty where relevant."},
-        {"role":"user","content":f"Question:\\n{question}\\n\\nComputed result:\\n{computed}\\n\\nExplain the method and steps."}]}
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.post(url, headers={"Authorization":f"Bearer {key}"}, json=payload)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"AI provider returned HTTP {response.status_code}. Check server settings.")
-    try: return response.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError): raise HTTPException(status_code=502, detail="Unexpected AI provider response.")
-
-@app.get("/api/health")
-def health():
-    return {"status":"ok","engine":"SymPy","ai_configured":bool(os.getenv("AI_API_KEY") and os.getenv("AI_MODEL"))}
-
-@app.post("/api/solve", response_model=SolveResponse)
-def solve(req: SolveRequest):
-    try: return solve_local(req.question)
-    except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
-    except Exception: raise HTTPException(status_code=422, detail="The solver could not complete this problem. Try clearer notation or a simpler expression.")
-
-@app.post("/api/explain", response_model=SolveResponse)
-async def explain(req: SolveRequest):
-    try: result = solve_local(req.question)
-    except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
-    text = await ai_explanation(req.question, result.answer)
-    return SolveResponse(answer=text, method=f"AI explanation + {result.method}", verified=result.verified,
-                         notes=["AI explanations can contain errors; compare with the symbolic result."])
-
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
-@app.get("/")
-def home(): return FileResponse(os.path.join(STATIC, "index.html"))
-@app.get("/manifest.webmanifest")
-def manifest(): return FileResponse(os.path.join(STATIC, "manifest.webmanifest"), media_type="application/manifest+json")
-@app.get("/service-worker.js")
-def sw(): return FileResponse(os.path.join(STATIC, "service-worker.js"), media_type="application/javascript")
-''',
-"app/static/index.html": r'''
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b1020"><meta name="description" content="AI Maths Engine Ultimate">
-<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/static/icon.svg" type="image/svg+xml">
-<title>AI Maths Engine Ultimate</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Maths Engine</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2e;--text:#edf3ff;--muted:#9eb0d0;--accent:#67e8f9;--accent2:#a78bfa;--border:#2a3858;--good:#86efac;--bad:#fda4af}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#17264a,#0b1020 55%);font-family:system-ui,Arial,sans-serif;color:var(--text);min-height:100vh}.wrap{max-width:1100px;margin:auto;padding:20px 14px 40px}.hero{display:flex;gap:13px;align-items:center;margin:8px 0 20px}.logo{width:54px;height:54px;flex:0 0 54px;border-radius:17px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:grid;place-items:center;color:#091225;font-size:28px;font-weight:900}.hero h1{font-size:clamp(1.35rem,5vw,2.25rem);margin:0}.hero p,.hint{color:var(--muted);line-height:1.5}.hero p{margin:4px 0}.badge{font-size:.75rem;color:#a5f3fc}.grid{display:grid;grid-template-columns:1.05fr .95fr;gap:15px}.card{background:#121a2eee;border:1px solid var(--border);border-radius:19px;padding:18px;min-width:0}.card h2{font-size:1.05rem;margin:0 0 12px}.label{display:block;font-weight:650;margin:13px 0 7px}textarea{width:100%;min-height:145px;resize:vertical}textarea,button{font:inherit}textarea{border:1px solid var(--border);border-radius:12px;background:#0b1224;color:var(--text);padding:13px}.row,.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.btn{border:0;border-radius:12px;padding:12px 15px;font-weight:750;min-height:44px;cursor:pointer}.primary{background:linear-gradient(100deg,var(--accent),#a5b4fc);color:#091225;flex:1}.secondary,.chip{background:#23304d;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:10px}.chip{border-radius:999px;font-size:.82rem}.answer{background:#0c1428;border:1px solid var(--border);border-radius:14px;padding:14px;min-height:190px;white-space:pre-wrap;line-height:1.65;overflow-wrap:anywhere}.status,.small{font-size:.84rem;color:var(--muted);line-height:1.5}.status.error{color:var(--bad)}.status.ok{color:var(--good)}.features{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:15px}.feature{border:1px solid var(--border);background:#121a2e;padding:12px;border-radius:13px;font-size:.84rem}.feature b{display:block;color:var(--accent);margin-bottom:3px}.divider{height:1px;background:var(--border);margin:17px 0}@media(max-width:760px){.grid{grid-template-columns:1fr}.card{padding:15px}.features{grid-template-columns:repeat(2,1fr)}}
-</style></head><body><div class="wrap">
-<header class="hero"><div class="logo">∑</div><div><h1>AI Maths Engine Ultimate</h1><p>Symbolic maths · answer checks · optional AI tutor</p><span class="badge" id="badge">Connecting to engine…</span></div></header>
-<main class="grid"><section class="card"><h2>Ask a maths question</h2><p class="hint">Type standard maths notation. Use * for multiplication and ^ for powers.</p>
-<label class="label" for="question">Your question</label><textarea id="question" placeholder="solve 2*x + 5 = 17&#10;solve x^2 - 5*x + 6 = 0&#10;simultaneous equations: x+y=7, x-y=1&#10;differentiate sin(x)*x^2"></textarea>
-<div class="chips"><button class="chip" data-q="solve 2*x + 5 = 17">Linear</button><button class="chip" data-q="solve x^2 - 5*x + 6 = 0">Quadratic</button><button class="chip" data-q="simultaneous equations: x+y=7, x-y=1">Simultaneous</button><button class="chip" data-q="differentiate x^3 + 2*x^2">Differentiate</button><button class="chip" data-q="integrate sin(x)">Integrate</button><button class="chip" data-q="factor x^2 - 5*x + 6">Factor</button><button class="chip" data-q="limit sin(x)/x as x -> 0">Limit</button><button class="chip" data-q="expand (x+2)^3">Expand</button></div>
-<div class="row"><button class="btn primary" id="solve">Solve question</button><button class="btn secondary" id="clear">Clear</button></div><div class="status" id="status" role="status" aria-live="polite">Ready.</div></section>
-<section class="card"><h2>Solution</h2><div class="answer" id="answer" aria-live="polite">Your solution and working will appear here.</div><div class="row"><button class="btn secondary" id="copy">Copy answer</button><button class="btn secondary" id="explain">Explain with AI</button></div><p class="small" id="verify">Verification status appears here after solving.</p><div class="divider"></div><h2>Capabilities</h2><p class="hint">Symbolic equations, systems, derivatives, integrals, limits, factorisation, expansion, simplification and common functions. Some questions need assumptions or specialist methods.</p></section></main>
-<section class="features"><div class="feature"><b>Symbolic maths</b>Exact expressions where supported</div><div class="feature"><b>Equation solver</b>Polynomial and many symbolic equations</div><div class="feature"><b>Calculus</b>Derivatives, integrals and limits</div><div class="feature"><b>Verification</b>Substitution checks when possible</div><div class="feature"><b>Phone-ready</b>Responsive browser interface</div><div class="feature"><b>AI tutor</b>Optional server-side AI explanation</div></section>
-<p class="small">This is a developing mathematics assistant, not a guarantee of solving every problem perfectly. Check assumptions and verify important results.</p></div>
+:root{--bg:#0b1020;--panel:#121a2e;--panel2:#18233b;--text:#edf3ff;--muted:#9eb0d0;--accent:#67e8f9;--accent2:#a78bfa;--border:#2a3858;--good:#86efac;--bad:#fda4af}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#17264a,#0b1020 55%);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--text);min-height:100vh}
+.wrap{max-width:1050px;margin:auto;padding:22px 15px 48px}.hero{display:flex;gap:15px;align-items:center;margin:8px 0 22px}.logo{width:54px;height:54px;border-radius:17px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:grid;place-items:center;color:#091225;font-size:28px;font-weight:900;box-shadow:0 8px 30px #67e8f933}.hero h1{font-size:clamp(1.5rem,5vw,2.3rem);margin:0}.hero p{margin:4px 0 0;color:var(--muted)}
+.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.card{background:#121a2eeb;border:1px solid var(--border);border-radius:20px;padding:20px;box-shadow:0 16px 50px #0002}.card h2{font-size:1.08rem;margin:0 0 13px}.label{display:block;font-weight:650;margin:13px 0 7px}textarea,input,select{width:100%;border:1px solid var(--border);border-radius:12px;background:#0b1224;color:var(--text);padding:13px;font:inherit;outline:none}textarea{min-height:130px;resize:vertical}textarea:focus,input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #67e8f91c}.row{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.btn{border:0;border-radius:12px;padding:12px 17px;font-weight:750;font-size:.95rem;cursor:pointer}.primary{background:linear-gradient(100deg,var(--accent),#a5b4fc);color:#091225;flex:1}.secondary{background:#23304d;color:var(--text);border:1px solid var(--border)}.btn:disabled{opacity:.65;cursor:wait}.hint{color:var(--muted);font-size:.9rem;line-height:1.5}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.chip{background:#1c2944;color:#dbeafe;border:1px solid #314363;border-radius:999px;padding:7px 10px;font-size:.82rem;cursor:pointer}.result{white-space:pre-wrap;line-height:1.65;overflow-wrap:anywhere}.status{font-size:.88rem;margin-top:10px;color:var(--muted)}.status.error{color:var(--bad)}.status.ok{color:var(--good)}.answerbox{background:#0c1428;border:1px solid var(--border);border-radius:14px;padding:15px;min-height:130px}.features{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:16px}.feature{border:1px solid var(--border);background:#121a2eaa;padding:12px;border-radius:13px;font-size:.86rem;color:#d6e2fa}.feature b{display:block;color:var(--accent);margin-bottom:3px}.small{font-size:.82rem;color:var(--muted)}.divider{height:1px;background:var(--border);margin:17px 0}
+@media(max-width:760px){.grid{grid-template-columns:1fr}.card{padding:16px}.features{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero"><div class="logo">∑</div><div><h1>AI Maths Engine</h1><p>Hybrid solver · exact maths tools + optional AI explanations</p></div></header>
+  <main class="grid">
+    <section class="card">
+      <h2>Ask a maths question</h2>
+      <p class="hint">Enter a problem in ordinary maths notation. The local engine handles several common problem types without an API key. For broader natural-language help, configure your own AI endpoint below.</p>
+      <label class="label" for="question">Your question</label>
+      <textarea id="question" placeholder="Examples:&#10;solve 2x + 5 = 17&#10;factor x^2 - 5x + 6&#10;differentiate x^3 + 2x&#10;integrate 3x^2&#10;solve simultaneous equations: x+y=7, x-y=1"></textarea>
+      <div class="chips">
+        <button class="chip" data-q="solve 2x + 5 = 17">Linear equation</button>
+        <button class="chip" data-q="solve x^2 - 5x + 6 = 0">Quadratic</button>
+        <button class="chip" data-q="solve simultaneous equations: x+y=7, x-y=1">Simultaneous</button>
+        <button class="chip" data-q="differentiate x^3 + 2x^2 - 4x + 1">Differentiate</button>
+        <button class="chip" data-q="integrate 3x^2 + 2x">Integrate</button>
+        <button class="chip" data-q="factor x^2 - 5x + 6">Factor</button>
+      </div>
+      <div class="row"><button class="btn primary" id="solveBtn">Solve question</button><button class="btn secondary" id="clearBtn">Clear</button></div>
+      <div id="status" class="status" role="status" aria-live="polite">Ready. Try one of the examples.</div>
+    </section>
+    <section class="card">
+      <h2>Solution</h2>
+      <div id="result" class="answerbox result">Your answer and working will appear here.</div>
+      <div class="divider"></div>
+      <h2>Optional online AI</h2>
+      <p class="hint">The built-in solver works without internet. For AI help with questions outside its supported methods, use an API endpoint you trust. Do not put a secret API key into a public or shared HTML file.</p>
+      <label class="label" for="apiUrl">AI endpoint URL (optional)</label>
+      <input id="apiUrl" type="url" placeholder="https://your-server.example/api/solve">
+      <label class="label" for="apiKey">API key (optional; stored only in this browser)</label>
+      <input id="apiKey" type="password" placeholder="Paste key only if you understand the risks">
+      <label class="label" for="apiModel">Model name (optional)</label>
+      <input id="apiModel" type="text" placeholder="Model name required by your endpoint">
+      <div class="row"><button class="btn secondary" id="saveBtn">Save settings</button><button class="btn secondary" id="testAiBtn">Try online AI</button></div>
+      <p class="small">Endpoint contract: POST JSON <code>{question, model}</code>; optional Authorization: Bearer token. Expected response can be plain text or JSON with <code>answer</code>, <code>output</code>, or <code>choices[0].message.content</code>. Configure a compatible server/proxy if your provider uses a different format.</p>
+    </section>
+  </main>
+  <section class="features">
+    <div class="feature"><b>Algebra</b>Linear and quadratic equations</div>
+    <div class="feature"><b>Systems</b>Two linear simultaneous equations</div>
+    <div class="feature"><b>Calculus</b>Polynomial differentiation/integration</div>
+    <div class="feature"><b>Expressions</b>Basic polynomial factorisation</div>
+    <div class="feature"><b>Mobile-ready</b>Responsive phone layout</div>
+    <div class="feature"><b>Hybrid design</b>Local methods + optional AI endpoint</div>
+  </section>
+  <p class="small" style="margin-top:18px">Important: this is a starter engine, not an all-knowing system. It clearly reports unsupported inputs rather than claiming every answer is guaranteed correct.</p>
+</div>
 <script>
-const $=id=>document.getElementById(id);let lastAnswer='';
-async function request(path,question){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,mode:'auto'})});const d=await r.json().catch(()=>({detail:'Unreadable server response.'}));if(!r.ok)throw Error(d.detail||`Request failed (${r.status})`);return d}
-async function run(ai=false){const q=$('question').value.trim();if(!q){$('status').textContent='Type a question first.';$('status').className='status error';return}
-$('solve').disabled=true;$('explain').disabled=true;$('answer').textContent='Working…';$('status').textContent=ai?'Calculating and asking the AI tutor…':'Calculating with the symbolic engine…';
-try{const d=await request(ai?'/api/explain':'/api/solve',q);lastAnswer=d.answer||'';$('answer').textContent=lastAnswer;$('verify').textContent='Method: '+d.method+(d.verified?' · Verification passed.':' · Automatic verification inconclusive.');$('status').textContent=ai?'AI explanation received. Compare it with the computed result.':'Solution generated.';$('status').className='status ok'}
-catch(e){$('answer').textContent='Could not solve this request.\\n\\n'+e.message;$('verify').textContent='No verified result available.';$('status').textContent=e.message;$('status').className='status error'}
-finally{$('solve').disabled=false;$('explain').disabled=false}}
-$('solve').onclick=()=>run(false);$('explain').onclick=()=>run(true);$('clear').onclick=()=>{$('question').value='';$('answer').textContent='Your solution and working will appear here.';$('verify').textContent='Verification status appears here after solving.';$('status').textContent='Cleared.';lastAnswer=''};
-$('copy').onclick=async()=>{if(!lastAnswer){$('status').textContent='Nothing to copy yet.';return}try{await navigator.clipboard.writeText(lastAnswer);$('status').textContent='Answer copied.'}catch(e){$('status').textContent='Select and copy the answer manually.'}};
-document.querySelectorAll('[data-q]').forEach(b=>b.onclick=()=>{$('question').value=b.dataset.q;$('question').focus()});$('question').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')run()});
-fetch('/api/health').then(r=>r.json()).then(d=>$('badge').textContent='Engine online · '+d.engine).catch(()=>$('badge').textContent='Backend unavailable — start the server');
-if('serviceWorker'in navigator)addEventListener('load',()=>navigator.serviceWorker.register('/service-worker.js').catch(()=>{}));
-</script></body></html>
-''',
-"app/static/manifest.webmanifest": json.dumps({"name":"AI Maths Engine Ultimate","short_name":"AI Maths","start_url":"/","display":"standalone","background_color":"#0b1020","theme_color":"#0b1020","icons":[{"src":"/static/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}, indent=2),
-"app/static/service-worker.js": r'''const CACHE="maths-ultimate-v1";const CORE=["/","/manifest.webmanifest","/static/icon.svg"];self.addEventListener("install",e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(CORE)));self.skipWaiting()});self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});self.addEventListener("fetch",e=>{const u=new URL(e.request.url);if(e.request.method!=="GET"||u.pathname.startsWith("/api/"))return;e.respondWith(fetch(e.request).then(r=>{if(r.ok&&u.origin===location.origin)caches.open(CACHE).then(c=>c.put(e.request,r.clone()));return r}).catch(async()=>await caches.match(e.request)||await caches.match("/")))})''',
-"app/static/icon.svg": r'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g"><stop stop-color="#67e8f9"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs><rect width="512" height="512" rx="100" fill="#0b1020"/><rect x="30" y="30" width="452" height="452" rx="85" fill="url(#g)"/><text x="256" y="350" font-family="Arial" font-size="310" font-weight="bold" text-anchor="middle" fill="#091225">∑</text></svg>''',
-"requirements.txt": """fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-sympy>=1.13,<2
-numpy>=2,<3
-scipy>=1.13,<2
-httpx>=0.27,<1
-pytest>=8,<9
-""",
-".env.example": """# Optional AI tutor settings: configure these on the server, never in the browser.
-# AI_API_URL=https://api.openai.com/v1/chat/completions
-# AI_API_KEY=your-private-server-side-key
-# AI_MODEL=provider-model-name
-""",
-"Dockerfile": """FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app ./app
-EXPOSE 8000
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
-""",
-"render.yaml": """services:
-  - type: web
-    name: ai-maths-engine-ultimate
-    runtime: docker
-    plan: free
-    healthCheckPath: /api/health
-    envVars:
-      - key: AI_API_URL
-        value: https://api.openai.com/v1/chat/completions
-      - key: AI_API_KEY
-        sync: false
-      - key: AI_MODEL
-        sync: false
-""",
-"tests/test_solver.py": r'''from fastapi.testclient import TestClient
-from app.main import app
-client = TestClient(app)
-def test_health():
-    assert client.get("/api/health").json()["status"] == "ok"
-def test_linear():
-    r=client.post("/api/solve",json={"question":"solve 2*x + 5 = 17"})
-    assert r.status_code==200 and "x = 6" in r.json()["answer"]
-def test_quadratic():
-    r=client.post("/api/solve",json={"question":"solve x^2 - 5*x + 6 = 0"})
-    assert r.status_code==200 and "2" in r.json()["answer"] and "3" in r.json()["answer"]
-def test_system():
-    r=client.post("/api/solve",json={"question":"simultaneous equations: x+y=7, x-y=1"})
-    assert r.status_code==200 and "x = 4" in r.json()["answer"] and "y = 3" in r.json()["answer"]
-def test_derivative():
-    r=client.post("/api/solve",json={"question":"differentiate x^3 + 2*x"})
-    assert r.status_code==200 and "3*x**2 + 2" in r.json()["answer"]
-def test_factor():
-    r=client.post("/api/solve",json={"question":"factor x^2 - 5*x + 6"})
-    assert r.status_code==200 and "x - 3" in r.json()["answer"]
-''',
-"README.md": r'''# AI Maths Engine Ultimate
-
-A full-stack starter project for a mathematics website that runs in a phone or desktop browser. It has a responsive frontend, a FastAPI backend, SymPy symbolic mathematics, an optional AI tutor, and a basic installable PWA setup.
-
-## Included
-- Mobile-friendly browser dashboard
-- `/api/solve`, `/api/explain`, `/api/health` backend endpoints
-- Symbolic equations, simultaneous systems, derivatives, integrals, limits, factorisation, expansion and simplification
-- Optional server-side AI explanations
-- PWA manifest/service worker
-- Dockerfile, Render deployment template, and starter tests
-
-## Run locally
-Python 3.11 or 3.12 recommended:
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-Open `http://127.0.0.1:8000`.
-
-## Use on Android
-The Python backend must be running online for solving to work. Deploy this project using the included Dockerfile/Render template or another Python host, then open its HTTPS website address in Chrome. Use Chrome menu → **Add to Home screen** / **Install app**. Opening `index.html` directly as a local file will not run the backend.
-
-## Optional AI tutor
-Configure `AI_API_URL`, `AI_API_KEY`, and `AI_MODEL` as server environment variables. The key must remain on the server; do not put it in HTML or a public repository. The AI endpoint explains a result already calculated by SymPy. AI explanations can still be wrong.
-
-## Test
-```bash
-pytest -q
-```
-
-## Example prompts
-- `solve 2*x + 5 = 17`
-- `solve x^2 - 5*x + 6 = 0`
-- `simultaneous equations: x+y=7, x-y=1`
-- `differentiate sin(x)*x^2`
-- `integrate exp(x)`
-- `limit sin(x)/x as x -> 0`
-- `factor x^2 - 5*x + 6`
-- `expand (x+2)^3`
-- `simplify (x^2-1)/(x-1)`
-
-Use explicit multiplication like `2*x` where possible.
-
-## Important limitations
-This is a strong starter, not a universal solver or a guarantee of perfect answers. It does not yet include handwriting/photo recognition, graph plotting, full word-problem interpretation, geometry-diagram understanding, rate limiting or production-grade abuse protection. Complex symbolic inputs can consume substantial CPU/memory, so harden and test the service before public deployment. Verify important results independently.
-"""
+const $ = id => document.getElementById(id);
+const qEl=$('question'), resultEl=$('result'), statusEl=$('status'), solveBtn=$('solveBtn');
+function status(msg,kind=''){statusEl.textContent=msg;statusEl.className='status '+kind}
+function fmt(n){if(!Number.isFinite(n))return String(n);if(Math.abs(n)<1e-10)n=0;return Number(n.toFixed(8)).toString()}
+function clean(s){return s.replace(/[−–]/g,'-').replace(/[×·]/g,'*').replace(/÷/g,'/').replace(/\s+/g,' ').trim()}
+function normExpr(s){
+  s=clean(s).toLowerCase().replace(/\^/g,'**').replace(/(\d)(x)/g,'$1*x').replace(/(x)(\d)/g,'$1*$2');
+  if(!/^[0-9x+\-*/().*\s]+$/.test(s))throw Error('For the local solver, use polynomial notation with x, numbers, +, -, *, /, parentheses and powers.');
+  return s;
 }
-
-for rel, content in files.items():
-    path = root / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
-
-zip_path = Path("/mnt/data/AI_Maths_Engine_Ultimate.zip")
-with ZipFile(zip_path, "w", ZIP_DEFLATED) as z:
-    for path in root.rglob("*"):
-        if path.is_file():
-            z.write(path, path.relative_to(root.parent))
-
-print("Project created successfully.")
-print(f"ZIP: {zip_path} ({zip_path.stat().st_size:,} bytes)")
-print(f"Files included: {len(files)}")
+// Small polynomial parser: coefficients are stored in ascending powers; supports + - * and integer powers.
+function polyParse(src){
+  let s=normExpr(src).replace(/\s/g,''); let i=0;
+  const add=(a,b,sgn=1)=>{let c=Array(Math.max(a.length,b.length)).fill(0);c.forEach((_,k)=>c[k]=(a[k]||0)+sgn*(b[k]||0));return trim(c)};
+  const trim=a=>{while(a.length>1&&Math.abs(a[a.length-1])<1e-10)a.pop();return a};
+  const mul=(a,b)=>{if(a.length+b.length>16)throw Error('Expression degree is too large for this starter solver.');let c=Array(a.length+b.length-1).fill(0);a.forEach((v,j)=>b.forEach((w,k)=>c[j+k]+=v*w));return trim(c)};
+  const power=(a,n)=>{if(n<0||n>8||!Number.isInteger(n))throw Error('Only integer powers from 0 to 8 are supported locally.');let r=[1];for(let z=0;z<n;z++)r=mul(r,a);return r};
+  function expr(){let a=term();while(i<s.length&&'+-'.includes(s[i])){let op=s[i++],b=term();a=add(a,b,op==='+'?1:-1)}return a}
+  function term(){let a=factor();while(i<s.length&&'* /'.includes(s[i])){let op=s[i++];let b=factor();if(op==='/'){if(b.length!==1||b[0]===0)throw Error('Local polynomial solver only divides by non-zero constants.');a=a.map(v=>v/b[0])}else a=mul(a,b)}return a}
+  function factor(){let sign=1;if(s[i]==='+')i++;else if(s[i]==='-'){sign=-1;i++}let a;
+    if(s[i]==='('){i++;a=expr();if(s[i]!==')')throw Error('Missing closing parenthesis.');i++}
+    else if(s[i]==='x'){i++;a=[0,1]}
+    else {let m=s.slice(i).match(/^(?:\d+\.?\d*|\.\d+)/);if(!m)throw Error('Could not parse expression near: '+s.slice(i));i+=m[0].length;a=[Number(m[0])]}
+    if(s.slice(i,i+2)==='**'){i+=2;let m=s.slice(i).match(/^\d+/);if(!m)throw Error('Add an integer power after ** or ^.');i+=m[0].length;a=power(a,Number(m[0]))}
+    return a.map(v=>v*sign)
+  }
+  const out=expr();if(i!==s.length)throw Error('Could not parse expression near: '+s.slice(i));return out;
+}
+function polyString(a){let terms=[];a.forEach((c,p)=>{if(Math.abs(c)<1e-9)return;let abs=Math.abs(c),v=p===0?fmt(abs):(abs===1?'':fmt(abs))+'x'+(p>1?'^'+p:'');terms.push({neg:c<0,v})});if(!terms.length)return '0';return terms.map((t,i)=>(i===0?(t.neg?'-':''):(t.neg?' - ':' + ')+t.v).join('')}
+function parseEquation(s){let bits=s.split('=');if(bits.length!==2)throw Error('Please write an equation with one equals sign, such as 2x+5=17.');return [polyParse(bits[0]),polyParse(bits[1])]}
+function subtractPoly(a,b){let n=Math.max(a.length,b.length),r=Array(n).fill(0);for(let i=0;i<n;i++)r[i]=(a[i]||0)-(b[i]||0);while(r.length>1&&Math.abs(r.at(-1))<1e-10)r.pop();return r}
+function solveLinear(a){let p=subtractPoly(a[0],a[1]);if(p.length>2)throw Error('This is not a linear equation.');let c=p[0]||0,m=p[1]||0;if(Math.abs(m)<1e-10)return Math.abs(c)<1e-10?'Every value of x satisfies the equation.':'No solution: the equation is inconsistent.';let x=-c/m;return `Rearrange into ax + b = 0:\n${polyString(p)} = 0\nMove the constant term and divide by the coefficient of x:\nx = ${fmt(x)}\n\nAnswer: x = ${fmt(x)}`}
+function solveQuadratic(a){let p=subtractPoly(a[0],a[1]);if(p.length>3)throw Error('This equation has degree higher than 2; local equation solver supports up to quadratics.');if(p.length<3)return solveLinear(a);let c=p[0]||0,b=p[1]||0,A=p[2]||0;if(Math.abs(A)<1e-10)return solveLinear(a);let d=b*b-4*A*c;let base=`Standard form: ${fmt(A)}x^2 ${b<0?'-':'+'} ${fmt(Math.abs(b))}x ${c<0?'-':'+'} ${fmt(Math.abs(c))} = 0\nDiscriminant: D = b^2 - 4ac = ${fmt(d)}\n`;if(d>=-1e-10){d=Math.max(0,d);let x1=(-b+Math.sqrt(d))/(2*A),x2=(-b-Math.sqrt(d))/(2*A);return base+`Quadratic formula: x = (-b ± √D)/(2a)\nRoots: x₁ = ${fmt(x1)}, x₂ = ${fmt(x2)}\n\nAnswer: x = ${fmt(x1)}${Math.abs(x1-x2)>1e-8?' or '+fmt(x2):''}`}let re=-b/(2*A),im=Math.sqrt(-d)/(2*Math.abs(A));return base+`There are no real roots.\nComplex roots: x = ${fmt(re)} ± ${fmt(im)}i`}
+function solveSimultaneous(s){let equations=s.split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean);if(equations.length!==2)throw Error('Enter exactly two equations separated by a comma, e.g. x+y=7, x-y=1.');let rows=equations.map(e=>{let [l,r]=parseEquation(e);let p=subtractPoly(l,r);if(p.length>3)throw Error('Only linear equations are supported in the simultaneous solver.');return [p[1]||0,p[2]||0,p[0]||0]}); // x and y coefficients: parser treats x only; accept y via replacement below not reached
+ return solveXY(equations)}
+function parseXY(e){let bits=e.split('=');if(bits.length!==2)throw Error('Each simultaneous equation needs one equals sign.');function coeff(side){let s=clean(side).toLowerCase().replace(/\s/g,'').replace(/-/g,'+-');if(s[0]==='+')s=s.slice(1);let x=0,y=0,c=0;for(let t of s.split('+').filter(Boolean)){let m=t.match(/^([+-]?(?:\d*\.?\d+)?)?([xy])?$/);if(!m)throw Error('Use linear equations such as 2x+3y=12.');let raw=m[1],v=raw===''||raw==='+'?1:raw==='-'?-1:Number(raw);if(!Number.isFinite(v))v=1;if(m[2]==='x')x+=v;else if(m[2]==='y')y+=v;else c+=v}return [x,y,c]}let a=coeff(bits[0]),b=coeff(bits[1]);return [a[0]-b[0],a[1]-b[1],b[2]-a[2]]}
+function solveXY(eq){let [a,b]=eq.map(parseXY);let det=a[0]*b[1]-b[0]*a[1];if(Math.abs(det)<1e-10)throw Error('These equations do not have a unique solution (they may be parallel or dependent).');let x=(a[2]*b[1]-b[2]*a[1])/det,y=(a[0]*b[2]-b[0]*a[2])/det;return `Equations in standard form:\n${fmt(a[0])}x + ${fmt(a[1])}y = ${fmt(a[2])}\n${fmt(b[0])}x + ${fmt(b[1])}y = ${fmt(b[2])}\n\nUse elimination or Cramer's rule.\nDeterminant = ${fmt(det)}\nx = ${fmt(x)}\ny = ${fmt(y)}\n\nAnswer: (x, y) = (${fmt(x)}, ${fmt(y)})`}
+function derivative(a){let d=a.slice(1).map((c,i)=>c*(i+1));if(!d.length)d=[0];return d}
+function integrate(a){let d=[0];a.forEach((c,i)=>d[i+1]=c/(i+1));return d}
+function solveLocal(raw){
+ let s=clean(raw),low=s.toLowerCase();
+ if(!s)throw Error('Type a maths question first.');
+ if(/simultaneous|system of equations/.test(low)||(/[,;\n]/.test(s)&&s.includes('=')&&/y/i.test(s)))return solveSimultaneous(s.replace(/^(solve\s+)?(simultaneous equations|system of equations)\s*:?/i,''));
+ if(/differentiat|derivative|d\/dx/.test(low)){let e=s.replace(/^(please\s+)?(differentiate|find the derivative of|derivative of|d\/dx)\s*/i,'').replace(/^d\/dx\s*/i,'');let p=polyParse(e),d=derivative(p);return `Original function: f(x) = ${polyString(p)}\nApply the power rule: d/dx (a·xⁿ) = a·n·xⁿ⁻¹.\n\nf′(x) = ${polyString(d)}`}
+ if(/integrat/.test(low)){let e=s.replace(/^(please\s+)?(integrate|find the integral of|integral of)\s*/i,'').replace(/\s+dx$/i,'');let p=polyParse(e),d=integrate(p);return `Integrand: ${polyString(p)}\nApply the power rule: ∫ a·xⁿ dx = a·xⁿ⁺¹/(n+1) + C.\n\nIntegral = ${polyString(d)} + C`}
+ if(/factor/.test(low)){let e=s.replace(/^factor(?:ise|ize)?\s*/i,'').replace(/\s*=\s*0$/,'');let p=polyParse(e);if(p.length===3&&Math.abs(p[2]-1)<1e-9){let [c,b]=p;let disc=b*b-4*c;if(disc>=0){let r1=(-b+Math.sqrt(disc))/2,r2=(-b-Math.sqrt(disc))/2;if(Number.isInteger(r1)&&Number.isInteger(r2))return `${polyString(p)}\nFind two numbers that multiply to ${fmt(c)} and add to ${fmt(b)}.\n\nFactorised form: (x ${r1<0?'-':'+'} ${fmt(Math.abs(r1))})(x ${r2<0?'-':'+'} ${fmt(Math.abs(r2))})`}}return 'The local factoriser currently handles monic quadratics with integer roots. Try an equation solver or use the optional AI endpoint for other expressions.'}
+ if(/solve|find x|equation/.test(low)||s.includes('=')){let eq=s.replace(/^(please\s+)?(solve|find x|solve for x|equation)\s*/i,'');let pair=parseEquation(eq),p=subtractPoly(pair[0],pair[1]);return p.length<=2?solveLinear(pair):solveQuadratic(pair)}
+ // Plain expression simplification / polynomial display
+ let p=polyParse(s);return `Parsed polynomial: ${polyString(p)}\n\nThis expression is valid. Ask to solve an equation, differentiate, integrate, or factor it to request a specific operation.`
+}
+async function askAI(raw){
+ const url=$('apiUrl').value.trim(),key=$('apiKey').value.trim(),model=$('apiModel').value.trim();
+ if(!url)throw Error('No AI endpoint is configured. Enter an endpoint URL and save settings, or use the local solver.');
+ const headers={'Content-Type':'application/json'};if(key)headers.Authorization='Bearer '+key;
+ const res=await fetch(url,{method:'POST',headers,body:JSON.stringify({question:raw,model})});
+ if(!res.ok)throw Error(`AI endpoint returned HTTP ${res.status}. Check the URL, server logs, and CORS configuration.`);
+ const data=await res.json().catch(async()=>({answer:await res.text()}));
+ return data.answer??data.output??data.choices?.[0]?.message?.content??JSON.stringify(data,null,2);
+}
+async function runSolve(useAI=false){let raw=qEl.value.trim();solveBtn.disabled=true;status(useAI?'Contacting your configured AI endpoint…':'Solving with the local maths engine…');resultEl.textContent='Working…';try{let ans;if(useAI)ans=await askAI(raw);else{try{ans=solveLocal(raw)}catch(localErr){if($('apiUrl').value.trim()){status('Local solver could not handle that input; trying online AI…');ans=await askAI(raw)}else throw localErr}}resultEl.textContent=String(ans);status(useAI?'AI response received. Verify important results.':'Solution generated by local engine. Verify complex or high-stakes calculations.','ok')}catch(e){resultEl.textContent='Could not solve this question yet.\n\n'+e.message;status(e.message,'error')}finally{solveBtn.disabled=false}}
+solveBtn.addEventListener('click',()=>runSolve(false));
+$('testAiBtn').addEventListener('click',()=>runSolve(true));
+$('clearBtn').addEventListener('click',()=>{qEl.value='';resultEl.textContent='Your answer and working will appear here.';status('Cleared.')});
+$('saveBtn').addEventListener('click',()=>{try{localStorage.setItem('mathsEndpoint',$('apiUrl').value.trim());localStorage.setItem('mathsModel',$('apiModel').value.trim());localStorage.setItem('mathsKey',$('apiKey').value);status('Settings saved in this browser. Keep API keys private.','ok')}catch(e){status('Could not save settings in this browser.','error')}});
+document.querySelectorAll('[data-q]').forEach(b=>b.addEventListener('click',()=>{qEl.value=b.dataset.q;qEl.focus()}));
+try{$('apiUrl').value=localStorage.getItem('mathsEndpoint')||'';$('apiModel').value=localStorage.getItem('mathsModel')||'';$('apiKey').value=localStorage.getItem('mathsKey')||''}catch(e){}
+qEl.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')runSolve(false)});
+</script>
+</body>
+</html>
